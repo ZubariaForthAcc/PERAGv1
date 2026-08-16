@@ -120,10 +120,3 @@ npx serve frontend/public -l 8080
 #  calls to point at http://localhost:4000/api/llm directly)
 ```
 
-## Notes on the provenance-aware evaluation itself
-
-The evaluation logic (benchmark presets, condition sweeps C1–C6, pollution
-sweep, fake-acceptance / recall scoring, gold-answer matching) is unchanged
-from the original single-file app — only the LLM transport and result
-persistence moved server-side. See the in-app sidebar and comments in
-`frontend/public/index.html` for details on each benchmark and condition.
