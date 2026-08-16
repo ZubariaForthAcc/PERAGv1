@@ -320,8 +320,11 @@
             </select>
           </div>
           <div class="field" id="field-api-key">
-            <label>API Key</label>
+            <label id="api-key-label">API Key</label>
             <input type="password" id="api-key" placeholder="sk-or-…" />
+          </div>
+          <div class="field" id="field-api-key-server-note" style="display:none">
+            <div style="font-size:11px;color:var(--c-muted)">🔒 Key for this provider is configured server-side (backend/.env) — nothing is entered here.</div>
           </div>
           <div class="field" id="field-base-url">
             <label>Base URL</label>
@@ -1544,19 +1547,22 @@ document.getElementById('llm-backend').addEventListener('change', function () {
   const isOpenRouter = this.value === 'openrouter';
   const isLocalModel = this.value === 'krikri' || this.value === 'eurollm';
   const isForth      = this.value === 'forth-gemma' || this.value === 'forth-qwen';
-  // Local vLLM-based models: no API key required; show base URL + model fields
-  document.getElementById('field-api-key').style.display  = (isOllama || isLocalModel) ? 'none' : '';
+  // Cloud providers: the key lives server-side in backend/.env and is never
+  // entered in the browser. Only self-hosted/local backends accept an
+  // optional token here, forwarded to the backend as an override.
+  const isCloudKeyed = ['anthropic', 'groq', 'openai', 'openrouter'].includes(this.value);
+  document.getElementById('field-api-key').style.display  = isCloudKeyed ? 'none' : '';
+  document.getElementById('field-api-key-server-note').style.display = isCloudKeyed ? '' : 'none';
   document.getElementById('field-base-url').style.display = (isOpenRouter || isOllama || isLocalModel || isForth) ? '' : 'none';
   document.getElementById('field-model').style.display    = (isOllama || isOpenRouter || isLocalModel || isForth || this.value === 'openai') ? '' : 'none';
   document.getElementById('field-groq-tpm').style.display  = (this.value === 'groq') ? '' : 'none';
-  // Show optional API key hint for local models (vLLM supports --api-key)
+  // Optional token override for local/self-hosted backends (vLLM supports --api-key)
   if (isLocalModel) {
-    document.getElementById('field-api-key').style.display = '';
     document.getElementById('api-key').placeholder = 'token-abc123 (optional, matches --api-key on vLLM)';
   } else if (isForth) {
     document.getElementById('api-key').placeholder = 'amd-pan-pan';
-  } else {
-    document.getElementById('api-key').placeholder = 'sk-or-…';
+  } else if (isOllama) {
+    document.getElementById('api-key').placeholder = 'usually not needed';
   }
   if (this.value === 'groq') {
     const limits = getGroqModelLimits(document.getElementById('model-name').value.trim());
@@ -2950,110 +2956,41 @@ function cancelExperiment() {
 // ── Small delay to respect free-tier rate limits ───────────────────────────
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── LLM call with backend-aware timeout and abort support ──────────────────
+// ── LLM call — proxied through the backend, which holds all cloud API keys ─
+// The browser never sees ANTHROPIC_API_KEY / GROQ_API_KEY / OPENAI_API_KEY /
+// OPENROUTER_API_KEY: those live in backend/.env. The `api-key` field (when
+// visible) is only used as an optional bearer token override for local /
+// self-hosted backends (ollama, krikri, eurollm, forth-*).
 async function callLLMOnce(prompt, system = '') {
   const backend = document.getElementById('llm-backend').value;
-  const apiKey  = document.getElementById('api-key').value.trim();
+  const apiKeyOverride = document.getElementById('api-key').value.trim();
   const baseUrl = document.getElementById('base-url').value.trim();
   const model   = document.getElementById('model-name').value.trim();
 
-  if (backend !== 'ollama' && backend !== 'krikri' && backend !== 'eurollm' && backend !== 'forth-gemma' && backend !== 'forth-qwen' && !apiKey) {
-    return '[No API key — add your key in the sidebar for live AI responses.]';
-  }
-
-  // Brief pause: Groq free tier ~30 req/min; other APIs 500ms courtesy delay
-  await delay(backend === 'groq' ? 2200 : 500);
-
-  // Timeout per call — Qwen runs in "thinking" mode (up to 8192 tokens) on a
-  // shared vLLM box, so it needs much longer than the other backends.
-  const timeoutMs = (backend === 'forth-qwen') ? 240000   // 4 min — thinking model
-                  : (backend === 'forth-gemma') ? 120000  // 2 min — larger remote model
-                  : 60000;                                 // default for hosted APIs
+  const timeoutMs = (backend === 'forth-qwen') ? 245000
+                  : (backend === 'forth-gemma') ? 125000
+                  : 65000; // slightly above the backend's own per-provider timeout
   const timeout = new AbortController();
   const timer   = setTimeout(() => timeout.abort(), timeoutMs);
-  // Also link to global abort (cancel button)
   const onGlobalAbort = () => timeout.abort();
   if (abortController) abortController.signal.addEventListener('abort', onGlobalAbort);
 
   try {
-    let res, data;
-    if (backend === 'anthropic') {
-      const body = { model: 'claude-haiku-4-5-20251001', max_tokens: 600, messages: [{ role:'user', content: prompt }] };
-      if (system) body.system = system;
-      res  = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', signal: timeout.signal,
-        headers: { 'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01' },
-        body: JSON.stringify(body) });
-      data = await res.json();
-      return data.error ? '[Anthropic error: '+data.error.message+']' : data.content[0].text;
+    const res = await fetch('/api/llm', {
+      method: 'POST',
+      signal: timeout.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ backend, model, baseUrl, system, prompt, apiKeyOverride }),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      return '[Backend error ' + res.status + ': ' + (errBody.error || 'unknown') + ']';
     }
-    if (backend === 'groq') {
-      const msgs = system ? [{ role:'system',content:system }] : [];
-      msgs.push({ role:'user',content:prompt });
-      res = await fetch('https://api.groq.com/openai/v1/chat/completions', { method:'POST', signal: timeout.signal,
-        headers: { 'Content-Type':'application/json','Authorization':'Bearer '+apiKey },
-        body: JSON.stringify({ model:'llama-3.3-70b-versatile', messages:msgs, max_tokens:600 }) });
-      data = await res.json();
-      if (data.error) return '[Groq error '+res.status+': '+data.error.message+']';
-      return data.choices[0].message.content;
-    }
-    if (backend === 'openai' || backend === 'openrouter') {
-      const msgs = system ? [{ role:'system',content:system }] : [];
-      msgs.push({ role:'user',content:prompt });
-      const url = (baseUrl || 'https://api.openai.com/v1') + '/chat/completions';
-      const mdl = model || (backend==='openai' ? 'gpt-4o-mini' : 'deepseek/deepseek-chat-v3-0324:free');
-      const headers = { 'Content-Type':'application/json','Authorization':'Bearer '+apiKey };
-      if (backend === 'openrouter') { headers['HTTP-Referer'] = window.location.href; headers['X-Title'] = 'PERAG Medical'; }
-      res  = await fetch(url, { method:'POST', signal: timeout.signal, headers, body: JSON.stringify({ model:mdl, messages:msgs, max_tokens:600 }) });
-      data = await res.json();
-      return data.error ? '[Error: '+(data.error.message||JSON.stringify(data.error))+']' : data.choices[0].message.content;
-    }
-    // ── Krikri (ILSP Greek LLM) & EuroLLM — OpenAI-compatible vLLM endpoint ──
-    if (backend === 'krikri' || backend === 'eurollm') {
-      const msgs = system ? [{ role:'system',content:system }] : [];
-      msgs.push({ role:'user',content:prompt });
-      const base = (baseUrl || 'http://localhost:8000/v1').replace(/\/$/,'');
-      const url  = base + '/chat/completions';
-      const mdl  = model || (backend === 'krikri' ? 'ilsp/Llama-Krikri-8B-Instruct' : 'utter-project/EuroLLM-9B-Instruct');
-      const headers = { 'Content-Type':'application/json' };
-      // vLLM accepts Bearer token when --api-key is set; harmless if blank
-      if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-      res  = await fetch(url, { method:'POST', signal: timeout.signal, headers,
-        body: JSON.stringify({ model: mdl, messages: msgs, max_tokens: 600 }) });
-      data = await res.json();
-      if (data.error) return '[' + (backend === 'krikri' ? 'Krikri' : 'EuroLLM') + ' error: ' + (data.error.message || JSON.stringify(data.error)) + ']';
-      return data.choices[0].message.content;
-    }
-    // ── FORTH-ICS (Papadakos shared vLLM) — OpenAI-compatible remote endpoints ──
-    if (backend === 'forth-gemma' || backend === 'forth-qwen') {
-      const msgs = system ? [{ role:'system',content:system }] : [];
-      msgs.push({ role:'user',content:prompt });
-      const isQwen    = backend === 'forth-qwen';
-      const defBase   = isQwen ? 'http://139.91.183.23:12345/v1' : 'http://139.91.183.23:1234/v1';
-      const defModel  = isQwen ? 'QuantTrio/Qwen3.6-35B-A3B-AWQ' : 'RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic';
-      const maxTok    = isQwen ? 8192 : 2048;
-      const base = (baseUrl || defBase).replace(/\/$/,'');
-      const url  = base + '/chat/completions';
-      const mdl  = model || defModel;
-      const headers = { 'Content-Type':'application/json', 'Authorization': 'Bearer ' + (apiKey || 'amd-pan-pan') };
-      res  = await fetch(url, { method:'POST', signal: timeout.signal, headers,
-        body: JSON.stringify({ model: mdl, messages: msgs, max_tokens: maxTok, temperature: 0.1 }) });
-      data = await res.json();
-      if (data.error) return '[FORTH-ICS error: ' + (data.error.message || JSON.stringify(data.error)) + ']';
-      return data.choices[0].message.content;
-    }
-    if (backend === 'ollama') {
-      const full = system ? system+'\n\n'+prompt : prompt;
-      const mdl  = model || 'llama3';
-      const base = (baseUrl || 'http://localhost:11434').replace(/\/$/,'');
-      res  = await fetch(base+'/api/generate', { method:'POST', signal: timeout.signal,
-        headers: { 'Content-Type':'application/json' },
-        body: JSON.stringify({ model:mdl, prompt:full, stream:false }) });
-      data = await res.json();
-      return data.response;
-    }
+    const data = await res.json();
+    return data.text;
   } catch (e) {
     if (e.name === 'AbortError') return '[Timed out or cancelled]';
-    return '[Request failed: '+e.message+']';
+    return '[Request failed: ' + e.message + ' — is the backend container running?]';
   } finally {
     clearTimeout(timer);
     if (abortController) abortController.signal.removeEventListener('abort', onGlobalAbort);
@@ -4542,8 +4479,8 @@ function initBatchUI() {
     polEl.value = saved;
     document.getElementById('batch-pol-val').textContent = saved + '%';
   }
-  renderModelQueue();
-  renderBatchTable();
+  loadModelQueueFromBackend();
+  loadBatchResultsFromBackend();
 }
 
 function toggleBatchBenchmark(k, checked) {
@@ -4577,9 +4514,33 @@ function renderModelQueue() {
       <span class="ql-remove" onclick="removeQueueRow(${i})" style="cursor:pointer;color:var(--c-danger)">✕</span>
     </div>`).join('') + `<button class="export-btn" style="font-size:10px" onclick="addQueueRow()">+ add model</button>`;
 }
-function updateQueueRow(i, field, val) { modelQueue[i][field] = val; lsSet(BATCH_QUEUE_KEY, modelQueue); }
-function addQueueRow() { modelQueue.push({ label: 'New', backend: 'groq', model: '', apiKey: '' }); lsSet(BATCH_QUEUE_KEY, modelQueue); renderModelQueue(); }
-function removeQueueRow(i) { modelQueue.splice(i, 1); lsSet(BATCH_QUEUE_KEY, modelQueue); renderModelQueue(); }
+function updateQueueRow(i, field, val) { modelQueue[i][field] = val; lsSet(BATCH_QUEUE_KEY, modelQueue); persistModelQueue(); }
+function addQueueRow() { modelQueue.push({ label: 'New', backend: 'groq', model: '', apiKey: '' }); lsSet(BATCH_QUEUE_KEY, modelQueue); renderModelQueue(); persistModelQueue(); }
+function removeQueueRow(i) { modelQueue.splice(i, 1); lsSet(BATCH_QUEUE_KEY, modelQueue); renderModelQueue(); persistModelQueue(); }
+
+// Model queue is persisted to Postgres (via the backend) alongside localStorage,
+// so the queue you built survives across machines/containers, not just this browser.
+function persistModelQueue() {
+  fetch('/api/queue', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(modelQueue.map((m) => ({ label: m.label, backend: m.backend, model: m.model, apiKeyOverride: m.apiKey }))),
+  }).catch((e) => console.error('[queue] failed to persist to backend', e));
+}
+async function loadModelQueueFromBackend() {
+  try {
+    const res = await fetch('/api/queue');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = await res.json();
+    if (rows.length) {
+      modelQueue = rows.map((r) => ({ label: r.label, backend: r.backend, model: r.model, apiKey: r.apiKeyOverride }));
+      lsSet(BATCH_QUEUE_KEY, modelQueue);
+    }
+  } catch (e) {
+    console.warn('[queue] backend unreachable, using local cache', e);
+  }
+  renderModelQueue();
+}
 
 // ── Applying one model-queue row to the actual sidebar controls ────────────
 async function applyModelConfig(cfg) {
@@ -4638,15 +4599,45 @@ function summarizeExperimentForBatch(expData, benchKey, modelCfg, variant, pollu
   };
 }
 
+// Results are persisted to Postgres via the backend (source of truth), with
+// localStorage kept only as an offline read cache so the table still renders
+// if the backend is briefly unreachable.
 function appendBatchRow(row) {
   batchResults.push(row);
   lsSet(BATCH_RESULTS_KEY, batchResults);
   renderBatchTable();
+  fetch('/api/results', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      benchmark: row.benchmark,
+      modelLabel: row.label || row.backend,
+      backend: row.backend,
+      model: row.model,
+      variant: row.variant,
+      pollutionPct: row.pollutionPct,
+      metrics: row,
+    }),
+  }).catch((e) => console.error('[results] failed to persist row to backend', e));
 }
 function clearBatchResults() {
   if (!confirm('Clear all stored batch matrix results? This cannot be undone.')) return;
   batchResults = [];
   lsSet(BATCH_RESULTS_KEY, batchResults);
+  renderBatchTable();
+  fetch('/api/results', { method: 'DELETE' }).catch((e) => console.error('[results] failed to clear backend results', e));
+}
+async function loadBatchResultsFromBackend() {
+  try {
+    const res = await fetch('/api/results');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const rows = await res.json();
+    // DB returns newest-first; batchResults/render expects oldest-first (it reverses for display)
+    batchResults = rows.map((r) => r.metrics).reverse();
+    lsSet(BATCH_RESULTS_KEY, batchResults);
+  } catch (e) {
+    console.warn('[results] backend unreachable, using local cache', e);
+  }
   renderBatchTable();
 }
 function exportBatchCSV() {
